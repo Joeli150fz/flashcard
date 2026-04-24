@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SRS Flashcards - Minimalist</title>
+    <!-- 引入基礎庫 -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- 使用官方推薦的 Lucide 載入方式 -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <style>
+        .preserve-3d { transform-style: preserve-3d; }
+        .backface-hidden { backface-visibility: hidden; }
+        .lucide { display: inline-block; vertical-align: middle; }
+        @keyframes fadeIn { from { opacity: 0; transform: scale(0.95); } to { opacity: 1; transform: scale(1); } }
+        .animate-fadeIn { animation: fadeIn 0.2s ease-out forwards; }
+    </style>
+</head>
+<body class="bg-slate-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback, useRef, memo, useMemo } = React;
+
+        // 優化後的圖示組件
+        const Icon = memo(({ name, className = "" }) => {
+            const iconRef = useRef(null);
+            useEffect(() => {
+                if (window.lucide && iconRef.current) {
+                    iconRef.current.innerHTML = '';
+                    const i = document.createElement('i');
+                    i.setAttribute('data-lucide', name);
+                    if (className) i.setAttribute('class', className);
+                    iconRef.current.appendChild(i);
+                    window.lucide.createIcons({ attrs: { class: className }, name: name });
+                }
+                return () => { if (iconRef.current) iconRef.current.innerHTML = ''; };
+            }, [name, className]);
+            return <span ref={iconRef} className="inline-flex items-center justify-center"></span>;
+        });
+
+        // 評分邏輯：Levenshtein Distance 單字版
+        const getLevenshteinScore = (targetText, userText) => {
+            if (!userText || userText.startsWith('⚠️')) return null;
+
+            // 預處理：轉小寫、去除標點符號、拆分成單字陣列
+            const clean = (str) => str.toLowerCase().replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, "").split(/\s+/).filter(x => x !== "");
+            
+            const targetWords = clean(targetText);
+            const userWords = clean(userText);
+            
+            if (targetWords.length === 0) return 10;
+
+            const n = targetWords.length;
+            const m = userWords.length;
+            const matrix = Array.from({ length: n + 1 }, () => Array(m + 1).fill(0));
+
+            for (let i = 0; i <= n; i++) matrix[i][0] = i;
+            for (let j = 0; j <= m; j++) matrix[0][j] = j;
+
+            for (let i = 1; i <= n; i++) {
+                for (let j = 1; j <= m; j++) {
+                    if (targetWords[i - 1] === userWords[j - 1]) {
+                        matrix[i][j] = matrix[i - 1][j - 1];
+                    } else {
+                        matrix[i][j] = Math.min(
+                            matrix[i - 1][j] + 1,    // 漏字 (刪除)
+                            matrix[i][j - 1] + 1,    // 多字 (插入)
+                            matrix[i - 1][j - 1] + 1 // 錯字 (替換)
+                        );
+                    }
+                }
+            }
+
+            const distance = matrix[n][m];
+            const penaltyPerError = 10 / n;
+            const score = Math.max(0, 10 - (distance * penaltyPerError));
+            
+            return {
+                score: parseFloat(score.toFixed(1)),
+                errors: distance
+            };
+        };
+
+        function App() {
+            const [originalCards, setOriginalCards] = useState([]);
+            const [cards, setCards] = useState([]);
+            const [isFlipped, setIsFlipped] = useState(false);
+            const [stats, setStats] = useState({ again: 0, hard: 0, good: 0, easy: 0, pass: 0 });
+            const [showInfo, setShowInfo] = useState(false);
+            
+
+            const recognitionRef = useRef(null);
+            const recognitionTimeoutRef = useRef(null);
+            const [isRecognitionActive, setIsRecognitionActive] = useState(false);
+
+            const [isPracticing, setIsPracticing] = useState(false);
+            const [practiceText, setPracticeText] = useState("");
+
+            const STORAGE_KEY = 'wordmem5_progress_v1';
+
+            // Restore saved progress (if any)
+            useEffect(() => {
+                try {
+                    const raw = localStorage.getItem(STORAGE_KEY);
+                    if (raw) {
+                        const parsed = JSON.parse(raw);
+                        if (parsed && parsed.originalCards && parsed.cards) {
+                            setOriginalCards(parsed.originalCards);
+                            setCards(parsed.cards);
+                            setStats(parsed.stats || { again: 0, hard: 0, good: 0, easy: 0, pass: 0 });
+                        }
+                    }
+                } catch (e) {
+                    console.warn('Restore progress failed', e);
+                }
+            }, []);
+
+            // Auto-save progress whenever relevant state changes
+            useEffect(() => {
+                try {
+                    const payload = {
+                        originalCards,
+                        cards,
+                        stats,
+                        savedAt: Date.now()
+                    };
+                    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+                } catch (e) {
+                    console.warn('Save progress failed', e);
+                }
+            }, [originalCards, cards, stats]);
+
+            // Ensure save on unload (extra safety)
+            useEffect(() => {
+                const handler = () => {
+                    try {
+                        const payload = { originalCards, cards, stats, savedAt: Date.now() };
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+                    } catch (e) {}
+                };
+                window.addEventListener('beforeunload', handler);
+                return () => window.removeEventListener('beforeunload', handler);
+            }, [originalCards, cards, stats]);
+
+            const getImageUrl = (word) => `https://loremflickr.com/400/250/${encodeURIComponent(word)}/all`;
+
+            const parseCSV = (text) => {
+                const result = [];
+                let currentLine = [];
+                let currentCell = '';
+                let inQuotes = false;
+                for (let i = 0; i < text.length; i++) {
+                    const char = text[i];
+                    if (char === '"') {
+                        if (inQuotes && text[i + 1] === '"') { currentCell += '"'; i++; }
+                        else inQuotes = !inQuotes;
+                    } else if (char === ',' && !inQuotes) {
+                        currentLine.push(currentCell.trim()); currentCell = '';
+                    } else if ((char === '\n' || char === '\r') && !inQuotes) {
+                        if (char === '\r' && text[i+1] === '\n') i++;
+                        currentLine.push(currentCell.trim());
+                        if (currentLine.length >= 2) result.push(currentLine);
+                        currentLine = []; currentCell = '';
+                    } else currentCell += char;
+                }
+                if (currentCell || currentLine.length > 0) {
+                    currentLine.push(currentCell.trim());
+                    if (currentLine.length >= 2) result.push(currentLine);
+                }
+                return result.filter(row => row.length >= 2 && row[0] !== '');
+            };
+
+            const handleFileUpload = (event) => {
+                const file = event.target.files[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = (e) => {
+                        const parsedData = parseCSV(e.target.result);
+                        const formatted = parsedData.map((row, idx) => ({ 
+                            id: `card-${idx}-${Date.now()}`, 
+                            front: row[0], 
+                            back: row[1] 
+                        }));
+                        setOriginalCards(formatted);
+                        setCards(formatted);
+                        setStats({ again: 0, hard: 0, good: 0, easy: 0, pass: 0 });
+                        // close the Instructions modal if user imported from there
+                        try { setShowInfo(false); } catch (e) {}
+                    };
+                    reader.readAsText(file);
+                }
+            };
+
+            const speak = useCallback((text, onEnd) => {
+                if (!window.speechSynthesis) return;
+                window.speechSynthesis.cancel();
+                const utterance = new SpeechSynthesisUtterance(text);
+                utterance.lang = /[\u4e00-\u9fa5]/.test(text) ? 'zh-TW' : 'en-US';
+                if (typeof onEnd === 'function') {
+                    utterance.onend = onEnd;
+                }
+                window.speechSynthesis.speak(utterance);
+            }, []);
+
+            useEffect(() => {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRecognition) {
+                    recognitionRef.current = new SpeechRecognition();
+                    recognitionRef.current.continuous = false;
+                    recognitionRef.current.interimResults = false;
+                    recognitionRef.current.lang = 'en-US';
+
+
+                    recognitionRef.current.onresult = (event) => {
+                        try {
+                            const transcript = event.results[0][0].transcript;
+                            setPracticeText(transcript);
+                            // 立即结束录音
+                            if (recognitionTimeoutRef.current) {
+                                clearTimeout(recognitionTimeoutRef.current);
+                                recognitionTimeoutRef.current = null;
+                            }
+                            if (recognitionRef.current) recognitionRef.current.stop();
+                        } catch (e) {
+                            console.error("語音辨識結果錯誤:", e);
+                            setPracticeText("⚠️ 辨識結果錯誤");
+                        }
+                    };
+
+                    recognitionRef.current.onstart = () => {
+                        setIsRecognitionActive(true);
+                        // 启动录音超时，5秒后强制结束
+                        if (recognitionTimeoutRef.current) clearTimeout(recognitionTimeoutRef.current);
+                        recognitionTimeoutRef.current = setTimeout(() => {
+                            setPracticeText("⚠️ 錄音超時，請重試");
+                            setIsPracticing(false);
+                            setIsRecognitionActive(false);
+                            if (recognitionRef.current) recognitionRef.current.stop();
+                        }, 5000);
+                    };
+
+                    recognitionRef.current.onend = () => {
+                        setIsPracticing(false);
+                        setIsRecognitionActive(false);
+                        if (recognitionTimeoutRef.current) {
+                            clearTimeout(recognitionTimeoutRef.current);
+                            recognitionTimeoutRef.current = null;
+                        }
+                    };
+
+                    recognitionRef.current.onerror = (event) => {
+                        console.error("語音辨識錯誤:", event.error);
+                        setIsPracticing(false);
+                        setIsRecognitionActive(false);
+                        if (recognitionTimeoutRef.current) {
+                            clearTimeout(recognitionTimeoutRef.current);
+                            recognitionTimeoutRef.current = null;
+                        }
+                        if (event.error === 'network') {
+                            setPracticeText("⚠️ 網路錯誤 (請下載 HTML 於獨立視窗開啟以使用 Google 辨識服務)");
+                        } else if (event.error === 'not-allowed') {
+                            setPracticeText("⚠️ 麥克風權限被拒絕");
+                        } else {
+                            setPracticeText(`⚠️ 錯誤: ${event.error}`);
+                        }
+                    };
+                }
+                // 卸载时清理定时器
+                return () => {
+                    if (recognitionTimeoutRef.current) {
+                        clearTimeout(recognitionTimeoutRef.current);
+                        recognitionTimeoutRef.current = null;
+                    }
+                };
+            }, []);
+
+            const practicePronunciation = useCallback((e) => {
+                e.stopPropagation();
+                const currentCard = cards[0];
+                if (!currentCard) return;
+                if (!recognitionRef.current) {
+                    setPracticeText("⚠️ 不支援語音辨識，請使用 Chrome。");
+                    return;
+                }
+
+                setPracticeText("");
+                setIsPracticing(true);
+                const wasActive = isRecognitionActive;
+
+                const startRecognition = () => {
+                    try {
+                        recognitionRef.current.start();
+                    } catch (err) {
+                        console.error("啟動錄音失敗:", err);
+                        const message = err?.message || String(err);
+                        if (message.includes('already started') || message.includes('InvalidStateError')) {
+                            recognitionRef.current.stop();
+                            setTimeout(startRecognition, 250);
+                            return;
+                        }
+                        setPracticeText(`⚠️ 啟動錄音失敗：${message}`);
+                        setIsPracticing(false);
+                    }
+                };
+
+                if (wasActive) {
+                    recognitionRef.current.stop();
+                }
+
+                speak(currentCard.back, () => {
+                    if (wasActive) {
+                        setTimeout(startRecognition, 200);
+                    } else {
+                        startRecognition();
+                    }
+                });
+            }, [cards, speak, isRecognitionActive]);
+
+            const handleSRS = useCallback((type) => {
+                if (cards.length === 0) return;
+                setIsPracticing(false);
+                setPracticeText("");
+                const current = cards[0];
+                const next = cards.slice(1);
+                setStats(prev => ({ ...prev, [type]: prev[type] + 1 }));
+                if (type === 'again') next.splice(1, 0, current);
+                else if (type === 'hard') next.splice(Math.floor(next.length / 2), 0, current);
+                else if (type === 'good') next.push(current);
+                setCards(next);
+                setIsFlipped(false);
+            }, [cards]);
+
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (showInfo) { if (e.key === 'Escape') setShowInfo(false); return; }
+                    if (cards.length === 0) return;
+                    if (e.code === 'Space') {
+                        e.preventDefault();
+                        setIsFlipped(prev => {
+                            if (prev) {
+                                setIsPracticing(false);
+                                setPracticeText("");
+                            }
+                            return !prev;
+                        });
+                    }
+                    if (!isFlipped && e.key === 'ArrowRight') {
+                        e.preventDefault();
+                        handleSRS('pass');
+                    }
+                    if (isFlipped) {
+                        if (e.key === '1') handleSRS('again');
+                        else if (e.key === '2') handleSRS('hard');
+                        else if (e.key === '3') handleSRS('good');
+                        else if (e.key === '4') handleSRS('easy');
+                    }
+                };
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, [cards, isFlipped, handleSRS, showInfo]);
+
+            useEffect(() => {
+                if (cards.length > 0) {
+                    speak(isFlipped ? cards[0].back : cards[0].front);
+                }
+                return () => { if(window.speechSynthesis) window.speechSynthesis.cancel(); };
+            }, [cards[0], isFlipped, speak]);
+
+            // 計算分數
+            const scoringResult = useMemo(() => {
+                return null;
+            }, []);
+
+            if (originalCards.length === 0) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-6 text-center">
+                        <div className="bg-white p-10 rounded-3xl shadow-xl max-w-sm w-full border border-slate-100">
+                            <Icon name="upload-cloud" className="w-16 h-16 text-blue-500 mx-auto mb-6" />
+                            <h1 className="text-2xl font-bold mb-2 text-slate-800">SRS Learning</h1>
+                            <p className="text-slate-400 mb-8 text-sm uppercase tracking-widest font-bold">Upload CSV to Start</p>
+                            <label className="bg-blue-600 text-white px-8 py-3 rounded-2xl font-bold cursor-pointer hover:bg-blue-700 block transition-all shadow-lg shadow-blue-200">
+                                Import File
+                                <input type="file" accept=".csv" onChange={handleFileUpload} className="hidden" />
+                            </label>
+                        </div>
+                    </div>
+                );
+            }
+
+            if (cards.length === 0) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center p-6 text-center">
+                        <div className="bg-white p-10 rounded-3xl shadow-xl max-w-sm w-full border border-slate-100">
+                            <h2 className="text-3xl font-bold mb-6 text-slate-800">Done!</h2>
+                            <div className="grid grid-cols-2 gap-4 mb-8 text-xs font-black uppercase tracking-widest">
+                                <div className="p-3 bg-red-50 text-red-600 rounded-xl">A: {stats.again}</div>
+                                <div className="p-3 bg-orange-50 text-orange-600 rounded-xl">H: {stats.hard}</div>
+                                <div className="p-3 bg-emerald-50 text-emerald-600 rounded-xl">G: {stats.good}</div>
+                                <div className="p-3 bg-blue-50 text-blue-600 rounded-xl">E: {stats.easy}</div>
+                            </div>
+                            <button onClick={() => { setCards(originalCards); setStats({ again: 0, hard: 0, good: 0, easy: 0, pass: 0 }); try { localStorage.removeItem(STORAGE_KEY); } catch (e) {} }} className="bg-slate-800 text-white w-full py-3 rounded-2xl font-bold hover:bg-slate-900 transition-colors">Restart</button>
+                        </div>
+                    </div>
+                );
+            }
+
+            const current = cards[0];
+            const finishedCount = originalCards.length - cards.length;
+            const progress = (finishedCount / originalCards.length) * 100;
+
+            const getScoreColor = (score) => {
+                if (score >= 8) return 'text-emerald-500 bg-emerald-50 border-emerald-100';
+                if (score >= 5) return 'text-orange-500 bg-orange-50 border-orange-100';
+                return 'text-red-500 bg-red-50 border-red-100';
+            };
+
+            return (
+                <div className="min-h-screen flex flex-col items-center justify-center p-4 relative">
+                    {showInfo && (
+                        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm" onClick={() => setShowInfo(false)}>
+                            <div className="bg-white rounded-3xl p-8 max-w-sm w-full shadow-2xl animate-fadeIn" onClick={e => e.stopPropagation()}>
+                                <h3 className="text-xl font-bold text-slate-800 mb-6">Instructions</h3>
+                                <div className="space-y-4 text-sm text-slate-600 font-medium">
+                                    <div className="flex justify-between items-center pb-2 border-b border-slate-50">
+                                        <span>Space</span>
+                                        <span className="text-slate-400">Flip Card</span>
+                                    </div>
+                                    <div className="flex justify-between items-center pb-2 border-b border-slate-50 text-purple-500 font-bold"><span>→ - Pass</span><span>Skip</span></div>
+                                    <div className="flex justify-between items-center pb-2 border-b border-slate-50 text-red-500 font-bold"><span>1 - Again</span><span>Soon</span></div>
+                                    <div className="flex justify-between items-center pb-2 border-b border-slate-50 text-orange-500 font-bold"><span>2 - Hard</span><span>Middle</span></div>
+                                    <div className="flex justify-between items-center pb-2 border-b border-slate-50 text-emerald-500 font-bold"><span>3 - Good</span><span>Later</span></div>
+                                    <div className="flex justify-between items-center pb-2 border-b border-slate-50 text-blue-500 font-bold"><span>4 - Easy</span><span>Removed</span></div>
+                                </div>
+                                <div className="mt-6">
+                                    <label className="bg-blue-600 text-white px-6 py-3 rounded-2xl font-bold cursor-pointer hover:bg-blue-700 block transition-all shadow-lg shadow-blue-200 mb-4 text-center">
+                                        Import CSV
+                                        <input type="file" accept=".csv" onChange={handleFileUpload} className="hidden" />
+                                    </label>
+                                </div>
+                                <button onClick={() => setShowInfo(false)} className="mt-2 w-full bg-slate-800 text-white py-3 rounded-2xl font-bold">Close</button>
+                            </div>
+                        </div>
+                    )}
+
+                    <div className="w-full max-w-md mb-6 px-2">
+                        <div className="flex justify-between items-center mb-3">
+                            <div className="flex items-center gap-4">
+                                <span className="text-sm font-black text-slate-800">{finishedCount} / {originalCards.length}</span>
+                                <div className="flex gap-2 text-[10px] font-black uppercase tracking-tighter">
+                                    <span className="text-red-500">A:{stats.again}</span>
+                                    <span className="text-orange-500">H:{stats.hard}</span>
+                                    <span className="text-emerald-500">G:{stats.good}</span>
+                                    <span className="text-blue-500">E:{stats.easy}</span>
+                                    <span className="text-purple-500">P:{stats.pass}</span>
+                                </div>
+                            </div>
+                            <button onClick={() => setShowInfo(true)} className="p-1.5 text-slate-300 hover:text-slate-500 transition-colors">
+                                <Icon name="info" className="w-4 h-4" />
+                            </button>
+                        </div>
+                        <div className="h-1 w-full bg-slate-200 rounded-full overflow-hidden">
+                            <div className="h-full bg-slate-800 transition-all duration-500" style={{width: `${progress}%`}}></div>
+                        </div>
+                    </div>
+
+                    <div className="relative w-full max-w-md h-[520px]" style={{ perspective: '1200px' }}>
+                        <div 
+                            className={`w-full h-full transition-transform duration-500 preserve-3d relative cursor-pointer ${isFlipped ? '[transform:rotateY(180deg)]' : ''}`}
+                            onClick={() => setIsFlipped(!isFlipped)}
+                        >
+                            {/* Front */}
+                            <div className="absolute w-full h-full bg-white rounded-3xl shadow-xl border border-slate-100 flex flex-col items-center justify-center p-8 backface-hidden shadow-slate-200/40">
+                                <h2 className="text-5xl font-black text-slate-800 mb-8 text-center leading-tight tracking-tight">{current.front}</h2>
+                                <button 
+                                    onClick={(e) => { e.stopPropagation(); speak(current.front); }} 
+                                    className="p-4 bg-slate-50 text-slate-400 rounded-full hover:bg-slate-100 transition-colors"
+                                >
+                                    <Icon name="volume-2" className="w-8 h-8"/>
+                                </button>
+                                <button 
+                                    onClick={(e) => { e.stopPropagation(); handleSRS('pass'); }} 
+                                    className="mt-4 px-6 py-2 bg-purple-500 text-white rounded-2xl text-sm font-bold hover:bg-purple-600 transition-colors"
+                                >
+                                    Pass
+                                </button>
+                                <p className="mt-12 text-slate-200 text-[10px] font-black uppercase tracking-[0.4em]">Space</p>
+                            </div>
+                            
+                            {/* Back */}
+                            <div className="absolute w-full h-full bg-white rounded-3xl shadow-xl border border-slate-100 overflow-hidden flex flex-col backface-hidden [transform:rotateY(180deg)] shadow-slate-200/40">
+                                <div className="h-32 w-full bg-slate-100 relative overflow-hidden flex-shrink-0">
+                                    <img 
+                                        key={`img-${current.id}`}
+                                        src={getImageUrl(current.front)} 
+                                        className="w-full h-full object-cover grayscale-[0.2]" 
+                                        alt={current.front}
+                                    />
+                                    <div className="absolute inset-0 bg-gradient-to-t from-black/10 to-transparent"></div>
+                                </div>
+                                
+                                <div className="flex-1 p-5 overflow-y-auto bg-white flex flex-col gap-4">
+                                    <div className="flex items-start justify-between gap-3">
+                                        <p className="text-lg text-slate-700 leading-relaxed whitespace-pre-wrap font-medium">{current.back}</p>
+                                        <button 
+                                            onClick={isRecognitionActive ? undefined : practicePronunciation}
+                                            className={`p-3 rounded-full flex-shrink-0 transition-all ${
+                                                isRecognitionActive ? "bg-red-500 text-white animate-pulse cursor-not-allowed opacity-70" : "bg-green-50 text-green-500 hover:bg-green-100"
+                                            }`}
+                                            disabled={isRecognitionActive}
+                                            aria-disabled={isRecognitionActive}
+                                            tabIndex={isRecognitionActive ? -1 : 0}
+                                        >
+                                            <Icon name={isRecognitionActive ? "mic" : "mic"} className="w-5 h-5"/>
+                                        </button>
+                                    </div>
+
+                                    {isRecognitionActive && (
+                                        <div className="p-3 rounded-2xl bg-red-50 border border-red-100 animate-pulse">
+                                            <p className="text-xs font-bold text-red-500 text-center">🎤 錄音中... 請說話</p>
+                                        </div>
+                                    )}
+
+                                    {practiceText && (
+                                        <div className="p-4 rounded-2xl border animate-fadeIn bg-green-50 border-green-100">
+                                            <p className="text-[10px] text-green-400 font-black uppercase tracking-widest mb-1">Your Pronunciation</p>
+                                            <p className="text-sm font-medium italic text-green-600">"{practiceText}"</p>
+                                        </div>
+                                    )}
+                                </div>
+
+                                <div className="p-3 bg-white border-t border-slate-50 flex gap-2 flex-shrink-0">
+                                    <button onClick={(e) => { e.stopPropagation(); handleSRS('again'); }} className="flex-1 py-4 bg-red-500 text-white rounded-2xl text-xs font-black uppercase active:scale-95 transition-transform">Again</button>
+                                    <button onClick={(e) => { e.stopPropagation(); handleSRS('hard'); }} className="flex-1 py-4 bg-orange-500 text-white rounded-2xl text-xs font-black uppercase active:scale-95 transition-transform">Hard</button>
+                                    <button onClick={(e) => { e.stopPropagation(); handleSRS('good'); }} className="flex-1 py-4 bg-emerald-500 text-white rounded-2xl text-xs font-black uppercase active:scale-95 transition-transform">Good</button>
+                                    <button onClick={(e) => { e.stopPropagation(); handleSRS('easy'); }} className="flex-1 py-4 bg-blue-500 text-white rounded-2xl text-xs font-black uppercase active:scale-95 transition-transform">Easy</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
